@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { useApi } from "@/hooks/use-api"
 import type { ChatSession, Message } from "@/types/chat"
+import { useParams, useRouter } from "next/navigation"
 
 // ─── Tipos de respuesta de la API ──────────────────────────────────
 interface SessionSummaryAPI {
@@ -30,12 +31,17 @@ function generateLocalTitle(firstMessage: string): string {
 export function useChatSessions() {
   const { token } = useAuth()
   const { apiFetch } = useApi()
+  const router = useRouter()
+  const params = useParams()
+  
+  // En Next.js [[...id]], params.id es un array. Tomamos el primer elemento si existe.
+  const urlId = params?.id?.[0] || null
 
   const [sessions, setSessions] = useState<ChatSession[]>([])
-  const [activeSessionId, setActiveSessionIdState] = useState<string | null>(null)
+  const [activeSessionId, setActiveSessionIdState] = useState<string | null>(urlId)
   const [isLoaded, setIsLoaded] = useState(false)
 
-  // ── 1. Cargar sesiones desde la nube al iniciar (cuando el token esté disponible) ──
+  // ── 1. Cargar sesiones desde la nube al iniciar ──
   useEffect(() => {
     if (!token) return
 
@@ -48,13 +54,33 @@ export function useChatSessions() {
         const mapped: ChatSession[] = data.map((s) => ({
           id: s.id,
           title: s.title,
-          messages: [],          // Los mensajes se cargan bajo demanda al seleccionar
+          messages: [],          
           createdAt: s.created_at,
           updatedAt: s.updated_at,
         }))
+        
         setSessions(mapped)
-        if (mapped.length > 0) {
-          setActiveSessionIdState(mapped[0].id)
+
+        if (urlId) {
+          // Si entramos con un ID por URL que no existe en la BD, creamos una sesión temporal local
+          if (!mapped.some(s => s.id === urlId)) {
+            const newSession: ChatSession = {
+              id: urlId,
+              title: "Nueva conversación",
+              messages: [],
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+            }
+            setSessions(prev => [newSession, ...prev])
+          }
+          setActiveSessionIdState(urlId)
+        } else if (mapped.length > 0) {
+          // Si entramos a /chat sin ID, redirigimos al más reciente
+          router.replace(`/chat/${mapped[0].id}`)
+        } else {
+          // No hay chats, creamos uno nuevo con un UUID
+          const tempId = crypto.randomUUID()
+          router.replace(`/chat/${tempId}`)
         }
       } catch (err) {
         console.error("[useChatSessions] Error cargando sesiones:", err)
@@ -64,23 +90,26 @@ export function useChatSessions() {
     }
 
     loadSessions()
-  }, [token]) // Se ejecuta cada vez que el token cambia (login/logout)
+  }, [token]) // Solo cargar al montar (o al iniciar sesión)
 
-  // ── Sesión activa ──────────────────────────────────────────────────
-  const activeSession = sessions.find((s) => s.id === activeSessionId) || null
+  // ── 2. Sincronizar URL con estado local (Navegación por la UI) ──
+  useEffect(() => {
+    if (urlId && urlId !== activeSessionId) {
+      setActiveSessionIdState(urlId)
+    }
+  }, [urlId, activeSessionId])
 
-  // ── 2. Seleccionar sesión: cargar mensajes desde la nube si aún no están ──
-  const setActiveSessionId = useCallback(
-    async (id: string) => {
-      setActiveSessionIdState(id)
+  // ── 3. Cargar mensajes del chat activo si están vacíos ──
+  useEffect(() => {
+    if (!activeSessionId) return
+    const session = sessions.find((s) => s.id === activeSessionId)
+    if (!session || session.messages.length > 0) return // Ya cargados o no existe
 
-      const session = sessions.find((s) => s.id === id)
-      if (!session || session.messages.length > 0) return  // Ya tiene mensajes cargados
-
+    const fetchMessages = async () => {
       try {
-        const res = await apiFetch(`/api/chat/sessions/${id}`)
-        if (!res.ok) throw new Error("Error cargando mensajes")
-
+        const res = await apiFetch(`/api/chat/sessions/${activeSessionId}`)
+        if (!res.ok) return
+        
         const data: MessageAPI[] = await res.json()
         const messages: Message[] = data.map((m) => ({
           id: m.id,
@@ -88,34 +117,36 @@ export function useChatSessions() {
           content: m.content,
           timestamp: m.timestamp,
         }))
-
+        
         setSessions((prev) =>
-          prev.map((s) => (s.id === id ? { ...s, messages } : s))
+          prev.map((s) => (s.id === activeSessionId ? { ...s, messages } : s))
         )
       } catch (err) {
         console.error("[useChatSessions] Error cargando mensajes:", err)
       }
+    }
+    
+    fetchMessages()
+  }, [activeSessionId, sessions, apiFetch])
+
+  const activeSession = sessions.find((s) => s.id === activeSessionId) || null
+
+  // ── 4. Seleccionar sesión desde el Sidebar (Cambia la URL) ──
+  const setActiveSessionId = useCallback(
+    async (id: string) => {
+      router.push(`/chat/${id}`)
     },
-    [sessions, apiFetch]
+    [router]
   )
 
-  // ── 3. Crear sesión nueva (el ID lo genera el backend implícitamente en el primer mensaje) ──
+  // ── 5. Crear sesión nueva (Cambia la URL a un nuevo UUID) ──
   const createSession = useCallback((): string => {
-    // Generamos un ID temporal local; el backend lo recibirá en el primer POST /api/chat/stream
-    const tempId = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`
-    const newSession: ChatSession = {
-      id: tempId,
-      title: "Nueva conversación",
-      messages: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }
-    setSessions((prev) => [newSession, ...prev])
-    setActiveSessionIdState(tempId)
+    const tempId = crypto.randomUUID()
+    router.push(`/chat/${tempId}`)
     return tempId
-  }, [])
+  }, [router])
 
-  // ── 4. Eliminar sesión: borrar en la nube y luego del estado local ──
+  // ── 6. Eliminar sesión ──
   const deleteSession = useCallback(
     async (sessionId: string) => {
       try {
@@ -127,15 +158,17 @@ export function useChatSessions() {
       setSessions((prev) => {
         const filtered = prev.filter((s) => s.id !== sessionId)
         if (activeSessionId === sessionId) {
-          setActiveSessionIdState(filtered.length > 0 ? filtered[0].id : null)
+          // Si borramos el chat actual, redirigimos a otro o creamos uno nuevo
+          const nextId = filtered.length > 0 ? filtered[0].id : crypto.randomUUID()
+          router.push(`/chat/${nextId}`)
         }
         return filtered
       })
     },
-    [activeSessionId, apiFetch]
+    [activeSessionId, apiFetch, router]
   )
 
-  // ── 5. Agregar mensaje al estado local (el backend ya lo guarda en el stream) ──
+  // ── 7. Agregar mensaje al estado local (el backend lo guarda vía streaming) ──
   const addMessage = useCallback(
     (sessionId: string, message: Omit<Message, "id" | "timestamp">) => {
       const newMessage: Message = {
@@ -170,7 +203,7 @@ export function useChatSessions() {
     []
   )
 
-  // ── 6. Actualizar último mensaje del asistente con el texto final del stream ──
+  // ── 8. Actualizar último mensaje del asistente con la respuesta final del stream ──
   const updateLastAssistantMessage = useCallback(
     (sessionId: string, content: string, sources?: Message["sources"]) => {
       setSessions((prev) =>
